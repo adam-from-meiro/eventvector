@@ -1,0 +1,93 @@
+# vector.yaml - Simplified configuration
+sources:
+  ga_events:
+    type: http_server
+    address: "0.0.0.0:8080"
+    path: "/collect"
+    method: "POST"
+    encoding: "json"
+
+transforms:
+  parse_and_validate:
+    type: remap
+    inputs: ["ga_events"]
+    source: |
+      # Validate required fields
+      if is_null(.event) {
+        log("Missing required field: event", level: "warn")
+        abort
+      }
+      
+      # Extract user identification
+      user_id = .userId || .user_id || .anonymousId || .session_id
+      if user_id != null {
+        .distinct_id = user_id
+      } else {
+        .distinct_id = uuid_v4()  
+      }
+      
+      # Handle timestamp - always ensure it's a proper timestamp object
+      if exists(.timestamp) && is_string(.timestamp) {
+        .timestamp = parse_timestamp!(.timestamp, format: "%+")
+      } else if !exists(.timestamp) {
+        .timestamp = now()
+      }
+      
+      # Initialize properties object
+      if is_null(.properties) {
+        .properties = {}
+      }
+      
+      # Add HTTP headers as regular properties
+      if exists(.headers."user-agent") {
+        .properties.user_agent = .headers."user-agent"
+      }
+      if exists(.headers."x-forwarded-for") {
+        .properties.ip_address = .headers."x-forwarded-for"
+      }
+      if exists(.headers.referer) {
+        .properties.referrer = .headers.referer
+      }
+      
+      # Map URL if provided
+      if exists(.url) {
+        .properties.current_url = .url
+      }
+
+  format_for_posthog:
+    type: remap
+    inputs: ["parse_and_validate"]
+    source: |
+      # Get the PostHog API key from environment
+      api_key = get_env_var("POSTHOG_API_KEY") ?? "missing_api_key"
+      
+      # Create the PostHog event structure
+      . = {
+        "api_key": api_key,
+        "event": .event,
+        "distinct_id": .distinct_id,
+        "timestamp": format_timestamp!(.timestamp, format: "%+"),
+        "properties": .properties
+      }
+
+sinks:
+  posthog:
+    type: http
+    inputs: ["format_for_posthog"]
+    uri: "https://app.posthog.com/capture/"
+    method: "post"
+    encoding:
+      codec: "json"
+    compression: "gzip"
+    batch:
+      max_events: 100
+      timeout_secs: 1
+    request:
+      retry_attempts: 3
+      retry_initial_backoff_secs: 1
+      retry_max_duration_secs: 30
+      timeout_secs: 30
+    buffer:
+      type: "memory"
+      max_events: 1000
+      when_full: "block"
