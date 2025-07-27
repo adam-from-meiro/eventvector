@@ -1,4 +1,4 @@
-# vector.yaml - Simplified configuration
+# vector.yaml - Clean configuration based on VRL examples
 sources:
   ga_events:
     type: http_server
@@ -12,58 +12,81 @@ transforms:
     type: remap
     inputs: ["ga_events"]
     source: |
-      # Validate required fields
-      if is_null(.event) {
-        log("Missing required field: event", level: "warn")
+      # Validate required fields using VRL patterns from examples
+      if !exists(.event) || is_nullish(.event) {
+        log("Missing or null event field", level: "warn")
         abort
       }
       
-      # Extract user identification
-      user_id = .userId || .user_id || .anonymousId || .session_id
-      if user_id != null {
-        .distinct_id = user_id
+      # Extract user identification with fallback chain (VRL example pattern)
+      if exists(.userId) {
+        .distinct_id = .userId
+      } else if exists(.user_id) {
+        .distinct_id = .user_id
+      } else if exists(.anonymousId) {
+        .distinct_id = .anonymousId
+      } else if exists(.session_id) {
+        .distinct_id = .session_id
       } else {
-        .distinct_id = uuid_v4()  
+        .distinct_id = uuid_v4()
       }
       
-      # Handle timestamp - always ensure it's a proper timestamp object
+      # Handle timestamp with multiple format support (from VRL examples)
       if exists(.timestamp) && is_string(.timestamp) {
-        .timestamp = parse_timestamp!(.timestamp, format: "%+")
-      } else if !exists(.timestamp) {
+        .timestamp = parse_timestamp(.timestamp, format: "%+") ?? 
+                    parse_timestamp(.timestamp, format: "%Y-%m-%dT%H:%M:%S%.3fZ") ?? 
+                    parse_timestamp(.timestamp, format: "%Y-%m-%dT%H:%M:%SZ") ?? 
+                    now()
+      } else {
         .timestamp = now()
       }
       
-      # Initialize properties object
-      if is_null(.properties) {
+      # Initialize properties if missing (VRL safe pattern)
+      if !exists(.properties) || !is_object(.properties) {
         .properties = {}
       }
       
-      # Add HTTP headers as regular properties
-      if exists(.headers."user-agent") {
-        .properties.user_agent = .headers."user-agent"
-      }
-      if exists(.headers."x-forwarded-for") {
-        .properties.ip_address = .headers."x-forwarded-for"
-      }
-      if exists(.headers.referer) {
-        .properties.referrer = .headers.referer
+      # Extract HTTP headers safely
+      if exists(.headers) && is_object(.headers) {
+        if exists(.headers."user-agent") && is_string(.headers."user-agent") {
+          .properties.user_agent = .headers."user-agent"
+        }
+        if exists(.headers."x-forwarded-for") && is_string(.headers."x-forwarded-for") {
+          .properties.ip_address = .headers."x-forwarded-for"
+        }
+        if exists(.headers.referer) && is_string(.headers.referer) {
+          .properties.referrer = .headers.referer
+        }
       }
       
-      # Map URL if provided
-      if exists(.url) {
+      # Map common parameters
+      if exists(.url) && is_string(.url) {
         .properties.current_url = .url
+      }
+      if exists(.value) {
+        .properties.value = .value
+      }
+      if exists(.category) && is_string(.category) {
+        .properties.category = .category
+      }
+      if exists(.label) && is_string(.label) {
+        .properties.label = .label
       }
 
   format_for_posthog:
     type: remap
     inputs: ["parse_and_validate"]
     source: |
-      # Get the PostHog API key from environment
-      api_key = get_env_var("POSTHOG_API_KEY") ?? "missing_api_key"
+      # Get PostHog API key using proper VRL error handling
+      api_key_value, err = get_env_var("POSTHOG_API_KEY")
+      if err != null {
+        log("Missing POSTHOG_API_KEY environment variable", level: "error")
+        abort
+      }
       
-      # Create the PostHog event structure
+      # Create final PostHog event (based on VRL examples structure)
       . = {
-        "api_key": api_key,
+        "api_key": api_key_value,
         "event": .event,
         "distinct_id": .distinct_id,
         "timestamp": format_timestamp!(.timestamp, format: "%+"),
