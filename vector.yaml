@@ -1,4 +1,4 @@
-# vector.yaml - Clean configuration based on VRL examples
+# vector.yaml - Enhanced with all event types from plan
 sources:
   ga_events:
     type: http_server
@@ -46,20 +46,21 @@ transforms:
         .properties = {}
       }
       
-      # Extract HTTP headers safely
+      # Extract HTTP headers safely for PostHog system properties
       if exists(.headers) && is_object(.headers) {
+        .http_context = {}
         if exists(.headers."user-agent") && is_string(.headers."user-agent") {
-          .properties.user_agent = .headers."user-agent"
+          .http_context.user_agent = .headers."user-agent"
         }
         if exists(.headers."x-forwarded-for") && is_string(.headers."x-forwarded-for") {
-          .properties.ip_address = .headers."x-forwarded-for"
+          .http_context.ip = .headers."x-forwarded-for"
         }
         if exists(.headers.referer) && is_string(.headers.referer) {
-          .properties.referrer = .headers.referer
+          .http_context.referrer = .headers.referer
         }
       }
       
-      # Map common parameters
+      # Map common analytics parameters
       if exists(.url) && is_string(.url) {
         .properties.current_url = .url
       }
@@ -72,10 +73,113 @@ transforms:
       if exists(.label) && is_string(.label) {
         .properties.label = .label
       }
+      
+      # Extract UTM parameters for marketing attribution
+      if exists(.utm_source) && is_string(.utm_source) {
+        .properties.utm_source = .utm_source
+      }
+      if exists(.utm_medium) && is_string(.utm_medium) {
+        .properties.utm_medium = .utm_medium
+      }
+      if exists(.utm_campaign) && is_string(.utm_campaign) {
+        .properties.utm_campaign = .utm_campaign
+      }
+      if exists(.utm_content) && is_string(.utm_content) {
+        .properties.utm_content = .utm_content
+      }
+      if exists(.utm_term) && is_string(.utm_term) {
+        .properties.utm_term = .utm_term
+      }
+
+  enrich_and_transform:
+    type: remap
+    inputs: ["parse_and_validate"]
+    source: |
+      # Event-specific transformations based on event type
+      event_name = .event
+      pageview_event = "$" + "pageview"
+      identify_event = "$" + "identify"
+      
+      # PAGE VIEW EVENTS
+      if event_name == pageview_event || event_name == "pageview" {
+        .event = pageview_event
+        # Ensure page view has required properties
+        if exists(.properties.current_url) {
+          .properties.page_url = .properties.current_url
+        }
+        if exists(.properties.page_title) && is_string(.properties.page_title) {
+          .properties.title = .properties.page_title
+        }
+      }
+      
+      # E-COMMERCE EVENTS
+      if event_name == "Product Added" || event_name == "product_added" {
+        .event = "Product Added"
+        # Standardize e-commerce properties
+        if exists(.properties.product_id) {
+          .properties.product_sku = .properties.product_id
+        }
+        if exists(.properties.price) {
+          .properties.revenue = .properties.price
+        }
+        if !exists(.properties.currency) {
+          .properties.currency = "USD"
+        }
+      }
+      
+      if event_name == "Purchase" || event_name == "purchase" || event_name == "order_completed" {
+        .event = "Purchase"
+        # Handle purchase-specific properties
+        if exists(.properties.total) {
+          .properties.revenue = .properties.total
+        }
+        if exists(.properties.value) && !exists(.properties.total) {
+          .properties.revenue = .properties.value
+        }
+        if !exists(.properties.currency) {
+          .properties.currency = "USD"
+        }
+      }
+      
+      # CUSTOM EVENTS (Button clicks, form submits, etc.)
+      if event_name == "Button Clicked" || event_name == "button_clicked" {
+        .event = "Button Clicked"
+        # Ensure button events have context
+        if exists(.properties.button_name) {
+          .properties.element_text = .properties.button_name
+        }
+      }
+      
+      if event_name == "Form Submitted" || event_name == "form_submitted" {
+        .event = "Form Submitted"
+        # Add form-specific context
+        if exists(.properties.form_name) {
+          .properties.form_id = .properties.form_name
+        }
+      }
+      
+      # USER IDENTIFICATION EVENTS
+      if event_name == identify_event || event_name == "identify" {
+        .event = identify_event
+        # Handle user traits for identification
+        if exists(.traits) && is_object(.traits) {
+          .properties = merge!(.properties, .traits)
+        }
+      }
+      
+      # SESSION EVENTS
+      if event_name == "Session Started" || event_name == "session_started" {
+        .event = "Session Started"
+        if exists(.session_id) {
+          .properties.session_id = .session_id
+        }
+      }
+      
+      # Default: keep event name as-is for other custom events
 
   format_for_posthog:
     type: remap
-    inputs: ["parse_and_validate"]
+    inputs: ["enrich_and_transform"]
     source: |
       # Get PostHog API key using proper VRL error handling
       api_key_value, err = get_env_var("POSTHOG_API_KEY")
@@ -84,14 +188,43 @@ transforms:
         abort
       }
       
-      # Create final PostHog event (based on VRL examples structure)
-      . = {
+      # Create PostHog event structure
+      posthog_event = {
         "api_key": api_key_value,
         "event": .event,
         "distinct_id": .distinct_id,
         "timestamp": format_timestamp!(.timestamp, format: "%+"),
         "properties": .properties
       }
+      
+      # Add PostHog system properties using safe string concatenation
+      if exists(.http_context) && is_object(.http_context) {
+        if exists(.http_context.user_agent) {
+          user_agent_key = "$" + "user_agent"
+          posthog_event.properties = set!(posthog_event.properties, [user_agent_key], .http_context.user_agent)
+        }
+        
+        if exists(.http_context.ip) {
+          ip_key = "$" + "ip"
+          posthog_event.properties = set!(posthog_event.properties, [ip_key], .http_context.ip)
+        }
+        
+        if exists(.http_context.referrer) {
+          referrer_key = "$" + "referrer"
+          posthog_event.properties = set!(posthog_event.properties, [referrer_key], .http_context.referrer)
+        }
+      }
+      
+      # Convert current_url to PostHog format
+      if exists(.properties.current_url) {
+        current_url_key = "$" + "current_url"
+        posthog_event.properties = set!(posthog_event.properties, [current_url_key], .properties.current_url)
+        # Remove the original current_url field
+        del(posthog_event.properties.current_url)
+      }
+      
+      # Set the final event
+      . = posthog_event
 
 sinks:
   posthog:
