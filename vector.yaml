@@ -1,4 +1,4 @@
-# vector.yaml - Enhanced with all event types from plan
+# vector.yaml - Dual Routing: Marketing → PostHog, Analytics → Mixpanel
 sources:
   ga_events:
     type: http_server
@@ -91,11 +91,34 @@ transforms:
         .properties.utm_term = .utm_term
       }
 
-  enrich_and_transform:
-    type: remap
+  route_events:
+    type: route
     inputs: ["parse_and_validate"]
+    route:
+      # MARKETING EVENTS → PostHog (Attribution, Sessions, Page Views)
+      to_posthog: |
+        .event == ("$" + "pageview") || .event == "pageview" ||
+        .event == ("$" + "identify") || .event == "identify" ||
+        .event == "Session Started" || .event == "session_started" ||
+        .event == "Newsletter Signup" ||
+        exists(.utm_source) ||
+        (.event == "Purchase" && exists(.properties.utm_campaign))
+      
+      # ANALYTICS EVENTS → Mixpanel (Interactions, Features, E-commerce)
+      to_mixpanel: |
+        .event == "Button Clicked" || .event == "button_clicked" ||
+        .event == "Form Submitted" || .event == "form_submitted" ||
+        .event == "Product Added" || .event == "product_added" ||
+        .event == "Purchase" || .event == "purchase" ||
+        .event == "Feature Used" ||
+        contains(string!(.event), "Click") || contains(string!(.event), "Submit")
+
+  # PostHog Processing Pipeline
+  enrich_for_posthog:
+    type: remap
+    inputs: ["route_events.to_posthog", "route_events._unmatched"]
     source: |
-      # Event-specific transformations based on event type
+      # Event-specific transformations for PostHog (Marketing Focus)
       event_name = .event
       pageview_event = "$" + "pageview"
       identify_event = "$" + "identify"
@@ -103,7 +126,8 @@ transforms:
       # PAGE VIEW EVENTS
       if event_name == pageview_event || event_name == "pageview" {
         .event = pageview_event
-        # Ensure page view has required properties
+        .properties.event_category = "marketing"
+        .properties.destination = "posthog"
         if exists(.properties.current_url) {
           .properties.page_url = .properties.current_url
         }
@@ -112,56 +136,11 @@ transforms:
         }
       }
       
-      # E-COMMERCE EVENTS
-      if event_name == "Product Added" || event_name == "product_added" {
-        .event = "Product Added"
-        # Standardize e-commerce properties
-        if exists(.properties.product_id) {
-          .properties.product_sku = .properties.product_id
-        }
-        if exists(.properties.price) {
-          .properties.revenue = .properties.price
-        }
-        if !exists(.properties.currency) {
-          .properties.currency = "USD"
-        }
-      }
-      
-      if event_name == "Purchase" || event_name == "purchase" || event_name == "order_completed" {
-        .event = "Purchase"
-        # Handle purchase-specific properties
-        if exists(.properties.total) {
-          .properties.revenue = .properties.total
-        }
-        if exists(.properties.value) && !exists(.properties.total) {
-          .properties.revenue = .properties.value
-        }
-        if !exists(.properties.currency) {
-          .properties.currency = "USD"
-        }
-      }
-      
-      # CUSTOM EVENTS (Button clicks, form submits, etc.)
-      if event_name == "Button Clicked" || event_name == "button_clicked" {
-        .event = "Button Clicked"
-        # Ensure button events have context
-        if exists(.properties.button_name) {
-          .properties.element_text = .properties.button_name
-        }
-      }
-      
-      if event_name == "Form Submitted" || event_name == "form_submitted" {
-        .event = "Form Submitted"
-        # Add form-specific context
-        if exists(.properties.form_name) {
-          .properties.form_id = .properties.form_name
-        }
-      }
-      
       # USER IDENTIFICATION EVENTS
       if event_name == identify_event || event_name == "identify" {
         .event = identify_event
-        # Handle user traits for identification
+        .properties.event_category = "marketing"
+        .properties.destination = "posthog"
         if exists(.traits) && is_object(.traits) {
           .properties = merge!(.properties, .traits)
         }
@@ -170,16 +149,29 @@ transforms:
       # SESSION EVENTS
       if event_name == "Session Started" || event_name == "session_started" {
         .event = "Session Started"
+        .properties.event_category = "marketing"
+        .properties.destination = "posthog"
         if exists(.session_id) {
           .properties.session_id = .session_id
         }
       }
       
-      # Default: keep event name as-is for other custom events
+      # MARKETING EVENTS
+      if event_name == "Newsletter Signup" {
+        .properties.event_category = "marketing"
+        .properties.destination = "posthog"
+      }
+      
+      # PURCHASE EVENTS (Marketing Attribution)
+      if event_name == "Purchase" && exists(.properties.utm_campaign) {
+        .properties.event_category = "marketing"
+        .properties.destination = "posthog"
+        .properties.attribution_focus = true
+      }
 
   format_for_posthog:
     type: remap
-    inputs: ["enrich_and_transform"]
+    inputs: ["enrich_for_posthog"]
     source: |
       # Get PostHog API key using proper VRL error handling
       api_key_value, err = get_env_var("POSTHOG_API_KEY")
@@ -226,6 +218,113 @@ transforms:
       # Set the final event
       . = posthog_event
 
+  # Mixpanel Processing Pipeline
+  enrich_for_mixpanel:
+    type: remap
+    inputs: ["route_events.to_mixpanel"]
+    source: |
+      # Event-specific transformations for Mixpanel (Analytics Focus)
+      event_name = .event
+      
+      # INTERACTION EVENTS
+      if event_name == "Button Clicked" || event_name == "button_clicked" {
+        .event = "Button Clicked"
+        .properties.event_category = "analytics"
+        .properties.destination = "mixpanel"
+        .properties.interaction_type = "click"
+        if exists(.properties.button_name) {
+          .properties.element_text = .properties.button_name
+        }
+      }
+      
+      if event_name == "Form Submitted" || event_name == "form_submitted" {
+        .event = "Form Submitted"
+        .properties.event_category = "analytics"
+        .properties.destination = "mixpanel"
+        .properties.interaction_type = "form"
+        if exists(.properties.form_name) {
+          .properties.form_id = .properties.form_name
+        }
+      }
+      
+      # E-COMMERCE EVENTS
+      if event_name == "Product Added" || event_name == "product_added" {
+        .event = "Product Added"
+        .properties.event_category = "analytics"
+        .properties.destination = "mixpanel"
+        .properties.ecommerce_action = "add_to_cart"
+        if exists(.properties.product_id) {
+          .properties.product_sku = .properties.product_id
+        }
+        if exists(.properties.price) {
+          .properties.revenue = .properties.price
+        }
+        if !exists(.properties.currency) {
+          .properties.currency = "USD"
+        }
+      }
+      
+      if event_name == "Purchase" || event_name == "purchase" {
+        .event = "Purchase"
+        .properties.event_category = "analytics"
+        .properties.destination = "mixpanel"
+        .properties.ecommerce_action = "purchase"
+        if exists(.properties.total) {
+          .properties.revenue = .properties.total
+        }
+        if exists(.properties.value) && !exists(.properties.total) {
+          .properties.revenue = .properties.value
+        }
+        if !exists(.properties.currency) {
+          .properties.currency = "USD"
+        }
+      }
+      
+      # FEATURE USAGE EVENTS
+      if event_name == "Feature Used" {
+        .properties.event_category = "analytics"
+        .properties.destination = "mixpanel"
+        .properties.interaction_type = "feature_usage"
+      }
+
+  format_for_mixpanel:
+    type: remap
+    inputs: ["enrich_for_mixpanel"]
+    source: |
+      # Get Mixpanel token using proper VRL error handling
+      mixpanel_token, err = get_env_var("MIXPANEL_TOKEN")
+      if err != null {
+        log("Missing MIXPANEL_TOKEN environment variable", level: "error")
+        abort
+      }
+      
+      # Create Mixpanel event structure (different from PostHog)
+      mixpanel_event = {
+        "event": .event,
+        "properties": .properties
+      }
+      
+      # Add required Mixpanel properties
+      mixpanel_event.properties.token = mixpanel_token
+      mixpanel_event.properties.distinct_id = .distinct_id
+      mixpanel_event.properties.time = to_unix_timestamp!(.timestamp, unit: "seconds")
+      
+      # Add HTTP context as Mixpanel properties
+      if exists(.http_context) && is_object(.http_context) {
+        if exists(.http_context.user_agent) {
+          mixpanel_event.properties.user_agent = .http_context.user_agent
+        }
+        if exists(.http_context.ip) {
+          mixpanel_event.properties.ip = .http_context.ip
+        }
+        if exists(.http_context.referrer) {
+          mixpanel_event.properties.referrer = .http_context.referrer
+        }
+      }
+      
+      # Set the final event
+      . = mixpanel_event
+
 sinks:
   posthog:
     type: http
@@ -236,7 +335,7 @@ sinks:
       codec: "json"
     compression: "gzip"
     batch:
-      max_events: 100
+      max_events: 50
       timeout_secs: 1
     request:
       retry_attempts: 3
@@ -245,5 +344,26 @@ sinks:
       timeout_secs: 30
     buffer:
       type: "memory"
-      max_events: 1000
+      max_events: 500
+      when_full: "block"
+
+  mixpanel:
+    type: http
+    inputs: ["format_for_mixpanel"]
+    uri: "https://api-eu.mixpanel.com/track"
+    method: "post"
+    encoding:
+      codec: "json"
+    compression: "gzip"
+    batch:
+      max_events: 50
+      timeout_secs: 1
+    request:
+      retry_attempts: 3
+      retry_initial_backoff_secs: 1
+      retry_max_duration_secs: 30
+      timeout_secs: 30
+    buffer:
+      type: "memory"
+      max_events: 500
       when_full: "block"
