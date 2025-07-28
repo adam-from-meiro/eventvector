@@ -95,23 +95,24 @@ transforms:
     type: route
     inputs: ["parse_and_validate"]
     route:
-      # MARKETING EVENTS → PostHog (Attribution, Sessions, Page Views)
+      # MARKETING EVENTS → PostHog (Attribution, Sessions, User Identification)
       to_posthog: |
-        .event == ("$" + "pageview") || .event == "pageview" ||
         .event == ("$" + "identify") || .event == "identify" ||
         .event == "Session Started" || .event == "session_started" ||
-        .event == "Newsletter Signup" ||
         exists(.utm_source) ||
         (.event == "Purchase" && exists(.properties.utm_campaign))
       
-      # ANALYTICS EVENTS → Mixpanel (Interactions, Features, E-commerce)
+      # ANALYTICS EVENTS → Mixpanel (Planned Events Only)
       to_mixpanel: |
-        .event == "Button Clicked" || .event == "button_clicked" ||
-        .event == "Form Submitted" || .event == "form_submitted" ||
-        .event == "Product Added" || .event == "product_added" ||
-        .event == "Purchase" || .event == "purchase" ||
-        .event == "Feature Used" ||
-        contains(string!(.event), "Click") || contains(string!(.event), "Submit")
+        .event == "Newsletter Signup" || .event == "newsletter_signup" ||
+        .event == "Sign Up" || .event == "signup" || .event == "user_signup" ||
+        .event == "Page View" || .event == "pageview" || .event == ("$" + "pageview") ||
+        .event == "Request Demo" || .event == "demo_request" || .event == "contact_form" ||
+        contains(string!(.event), "Demo") || contains(string!(.event), "Contact")
+      
+      # USER IDENTIFICATION → Mixpanel User Profiles (in addition to PostHog)
+      to_mixpanel_profiles: |
+        .event == ("$" + "identify") || .event == "identify"
 
   # PostHog Processing Pipeline
   enrich_for_posthog:
@@ -223,68 +224,89 @@ transforms:
     type: remap
     inputs: ["route_events.to_mixpanel"]
     source: |
-      # Event-specific transformations for Mixpanel (Analytics Focus)
+      # Transform to Mixpanel Planned Events with Required Properties
       event_name = .event
       
-      # INTERACTION EVENTS
-      if event_name == "Button Clicked" || event_name == "button_clicked" {
-        .event = "Button Clicked"
+      # 1. SIGN UP EVENT (Planned in Mixpanel)
+      if event_name == "Newsletter Signup" || event_name == "newsletter_signup" || 
+         event_name == "Sign Up" || event_name == "signup" || event_name == "user_signup" {
+        .event = "Sign Up"
         .properties.event_category = "analytics"
         .properties.destination = "mixpanel"
-        .properties.interaction_type = "click"
-        if exists(.properties.button_name) {
-          .properties.element_text = .properties.button_name
+        
+        # Required Mixpanel properties: Country, OS, Source
+        if exists(.properties.country) {
+          .properties.Country = .properties.country
+        } else {
+          .properties.Country = "Unknown"
+        }
+        
+        if exists(.properties.os) {
+          .properties.OS = .properties.os
+        } else {
+          .properties.OS = "Web"
+        }
+        
+        if exists(.properties.utm_source) {
+          .properties.Source = .properties.utm_source
+        } else if exists(.properties.source) {
+          .properties.Source = .properties.source
+        } else {
+          .properties.Source = "Direct"
         }
       }
       
-      if event_name == "Form Submitted" || event_name == "form_submitted" {
-        .event = "Form Submitted"
+      # 2. PAGE VIEW EVENT (Planned in Mixpanel)
+      if event_name == "Page View" || event_name == "pageview" || event_name == ("$" + "pageview") {
+        .event = "Page View"
         .properties.event_category = "analytics"
         .properties.destination = "mixpanel"
-        .properties.interaction_type = "form"
-        if exists(.properties.form_name) {
-          .properties.form_id = .properties.form_name
+        
+        # Required Mixpanel properties: Page Name, Referrer URL Path
+        page_name = "Unknown Page"
+        if exists(.properties.page_title) {
+          page_name = .properties.page_title
         }
+        if exists(.properties.page_name) && page_name == "Unknown Page" {
+          page_name = .properties.page_name
+        }
+        .properties = set!(.properties, ["Page Name"], page_name)
+        
+        referrer_path = "Direct"
+        if exists(.http_context.referrer) {
+          referrer_path = .http_context.referrer
+        }
+        if exists(.properties.referrer) && referrer_path == "Direct" {
+          referrer_path = .properties.referrer
+        }
+        .properties = set!(.properties, ["Referrer URL Path"], referrer_path)
       }
       
-      # E-COMMERCE EVENTS
-      if event_name == "Product Added" || event_name == "product_added" {
-        .event = "Product Added"
+      # 3. REQUEST DEMO EVENT (Planned in Mixpanel)
+      if event_name == "Request Demo" || event_name == "demo_request" || event_name == "contact_form" ||
+         contains(string!(.event), "Demo") || contains(string!(.event), "Contact") {
+        .event = "Request Demo"
         .properties.event_category = "analytics"
         .properties.destination = "mixpanel"
-        .properties.ecommerce_action = "add_to_cart"
-        if exists(.properties.product_id) {
-          .properties.product_sku = .properties.product_id
+        
+        # Required Mixpanel properties: Contact Method, Area of Interest
+        contact_method = "Web Form"
+        if exists(.properties.contact_method) {
+          contact_method = .properties.contact_method
         }
-        if exists(.properties.price) {
-          .properties.revenue = .properties.price
+        if exists(.properties.method) && contact_method == "Web Form" {
+          contact_method = .properties.method
         }
-        if !exists(.properties.currency) {
-          .properties.currency = "USD"
+        .properties = set!(.properties, ["Contact Method"], contact_method)
+        
+        area_interest = "General"
+        if exists(.properties.area_of_interest) {
+          area_interest = .properties.area_of_interest
         }
-      }
-      
-      if event_name == "Purchase" || event_name == "purchase" {
-        .event = "Purchase"
-        .properties.event_category = "analytics"
-        .properties.destination = "mixpanel"
-        .properties.ecommerce_action = "purchase"
-        if exists(.properties.total) {
-          .properties.revenue = .properties.total
+        if exists(.properties.product) && area_interest == "General" {
+          area_interest = .properties.product
         }
-        if exists(.properties.value) && !exists(.properties.total) {
-          .properties.revenue = .properties.value
-        }
-        if !exists(.properties.currency) {
-          .properties.currency = "USD"
-        }
-      }
-      
-      # FEATURE USAGE EVENTS
-      if event_name == "Feature Used" {
-        .properties.event_category = "analytics"
-        .properties.destination = "mixpanel"
-        .properties.interaction_type = "feature_usage"
+        .properties = set!(.properties, ["Area of Interest"], area_interest)
       }
 
   format_for_mixpanel:
@@ -298,13 +320,13 @@ transforms:
         abort
       }
       
-      # Create Mixpanel event structure (different from PostHog)
+      # Create Mixpanel event structure (back to /track endpoint format) 
       mixpanel_event = {
         "event": .event,
         "properties": .properties
       }
       
-      # Add required Mixpanel properties
+      # Add required Mixpanel /track properties
       mixpanel_event.properties.token = mixpanel_token
       mixpanel_event.properties.distinct_id = .distinct_id
       mixpanel_event.properties.time = to_unix_timestamp!(.timestamp, unit: "seconds")
@@ -322,8 +344,44 @@ transforms:
         }
       }
       
-      # Set the final event
-      . = mixpanel_event
+      # Mixpanel /import requires ARRAY format
+      . = [mixpanel_event]
+
+  # Mixpanel User Profiles Processing
+  format_for_mixpanel_profiles:
+    type: remap
+    inputs: ["route_events.to_mixpanel_profiles"]
+    source: |
+      # Get Mixpanel token
+      mixpanel_token, err = get_env_var("MIXPANEL_TOKEN") 
+      if err != null {
+        log("Missing MIXPANEL_TOKEN environment variable", level: "error")
+        abort
+      }
+      
+      # Create Mixpanel profile update (format for /engage endpoint)
+      profile_data = {}
+      
+      # Extract user traits/properties
+      if exists(.traits) && is_object(.traits) {
+        profile_data = .traits
+      } else if exists(.properties) && is_object(.properties) {
+        profile_data = .properties
+      }
+      
+      # Create the payload for /engage endpoint (as array)
+      token_key = "$" + "token"
+      distinct_id_key = "$" + "distinct_id"
+      set_key = "$" + "set"
+      
+      # Build the profile update object dynamically
+      profile_update = {}
+      profile_update = set!(profile_update, [token_key], mixpanel_token)
+      profile_update = set!(profile_update, [distinct_id_key], .distinct_id)
+      profile_update = set!(profile_update, [set_key], profile_data)
+      
+      # Mixpanel expects an array of profile updates
+      . = [profile_update]
 
 sinks:
   posthog:
@@ -366,4 +424,25 @@ sinks:
     buffer:
       type: "memory"
       max_events: 500
+      when_full: "block"
+
+  mixpanel_profiles:
+    type: http
+    inputs: ["format_for_mixpanel_profiles"]
+    uri: "https://api-eu.mixpanel.com/engage"
+    method: "post"
+    encoding:
+      codec: "json"
+    compression: "gzip"
+    batch:
+      max_events: 1
+      timeout_secs: 1
+    request:
+      retry_attempts: 3
+      retry_initial_backoff_secs: 1
+      retry_max_duration_secs: 30
+      timeout_secs: 30
+    buffer:
+      type: "memory"
+      max_events: 100
       when_full: "block"
