@@ -1,0 +1,73 @@
+sources:
+  ga_events:
+    type: http_server
+    address: "0.0.0.0:8080"
+    path: "/collect"
+    method: "POST"
+    encoding: "json"
+    headers:
+      - "User-Agent"
+      - "X-Forwarded-For"
+      - "Referer"
+    # Optimize for higher concurrency
+    keepalive:
+      max_connection_age_secs: 300
+
+transforms:
+  # Add performance tracking
+  add_performance_metadata:
+    type: remap
+    inputs: ["ga_events"]
+    source: |
+      .performance_metadata = {
+        "processed_at": now(),
+        "batch_id": to_string!(to_unix_timestamp!(now(), unit: "milliseconds")),
+        "test_run": true
+      }
+
+  # Sample events for console logging (1 in 1000 events)
+  sample_for_console:
+    type: sample
+    inputs: ["add_performance_metadata"] 
+    rate: 1000  # Only pass 1 in 1000 events
+
+sinks:
+  # Mock HTTP endpoint that simulates your target with 100ms latency
+  performance_test_sink:
+    type: http
+    inputs: ["add_performance_metadata"]
+    # Use host.docker.internal to connect from Vector container to mock server on host
+    uri: "http://host.docker.internal:9090/batch"
+    method: "post"
+    encoding:
+      codec: "json"
+    compression: "gzip"
+    # Realistic batching behavior - 10K events per batch
+    batch:
+      max_events: 10000        # Target batch size
+      timeout_secs: 5          # Maximum time to wait for batch to fill
+    buffer:
+      type: "memory"
+      max_events: 50000        # Buffer to handle bursts
+      when_full: "block"       # Block when buffer is full (realistic backpressure)
+    request:
+      retry_attempts: 3
+      retry_initial_backoff_secs: 1
+      retry_max_duration_secs: 30
+      timeout_secs: 10         # Longer timeout to account for 100ms + processing
+  
+  # Optional: Log performance metrics to console (sampled - 1 in 1000 events)
+  performance_metrics:
+    type: console
+    inputs: ["sample_for_console"]
+    target: "stdout"
+    encoding:
+      codec: "json"
+
+  # Optional: Write sample events to file for verification
+  sample_events:
+    type: file
+    inputs: ["sample_for_console"]  # Use sampled events to avoid huge files
+    path: "/tmp/vector_performance_sample.log"
+    encoding:
+      codec: "json" 
